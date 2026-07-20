@@ -2,6 +2,8 @@
 #define _PAINLESS_MESH_CONNECTION_HPP_
 
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "Arduino.h"
 #include "painlessmesh/configuration.hpp"
@@ -46,6 +48,37 @@ extern uint32_t lastScheduledDeletionTime; // Timestamp of last deletion schedul
 
 // Shared buffer for reading/writing to the buffer
 extern painlessmesh::buffer::temp_buffer_t shared_buffer;
+
+// --- Local Fix  for use-after-free in Task::disable() (upstream issue #373) ---
+// Task::disable() writes on instance AFTER the task has been deleted. This is a use-after-free (UAF) bug in AsyncTCP.
+// return: deleting "this" inside its own onDisable is therefore a UAF
+// guaranteed. Return the deletion queue for AsyncClient cleanup tasks. This queue is processed by a dedicated "reaper" task that runs 
+// in the scheduler's main loop, ensuring that deletions occur outside of the disable() stack context of the task being deleted.
+//  This prevents use-after-free issues and ensures safe cleanup of AsyncClient instances.
+inline std::vector<std::pair<Task*, Scheduler*>>& pendingTaskDeletions() {
+  static std::vector<std::pair<Task*, Scheduler*>> v;
+  return v;
+}
+
+inline void ensureCleanupReaper(Scheduler* scheduler) {
+  static bool started = false;
+  if (started) return;
+  started = true;
+  static Task reaper(50 * TASK_MILLISECOND, TASK_FOREVER, []() {
+    auto& q = pendingTaskDeletions();
+    if (q.empty()) return;
+    // a copy and empty before run, for security against 
+    // any new scheduling triggered indirectly by the deletes. 
+    std::vector<std::pair<Task*, Scheduler*>> toDelete;
+    toDelete.swap(q);
+    for (auto& p : toDelete) {
+      p.second->deleteTask(*p.first);
+      delete p.first;
+    }
+  });
+  scheduler->addTask(reaper);
+  reaper.enable();
+}
 
 /**
  * Schedule deletion of an AsyncClient with proper spacing to prevent concurrent cleanups
@@ -123,12 +156,12 @@ inline void scheduleAsyncClientDeletion(Scheduler* scheduler, AsyncClient* clien
     delete client;
   });
 
-  // Self-cleanup: after execution, remove from scheduler and delete the Task.
-  // OnDisable fires after a TASK_ONCE task completes its single iteration.
+  // Don't delete the instance here (see issue #373): we just enqueue it for deletion by the reaper task
+  // the actual deletion is done by the reaper task outside the disable() stack.
   cleanupTask->setOnDisable([cleanupTask, scheduler]() {
-    scheduler->deleteTask(*cleanupTask);
-    delete cleanupTask;
+    pendingTaskDeletions().push_back({cleanupTask, scheduler});
   });
+  ensureCleanupReaper(scheduler);
 
   scheduler->addTask(*cleanupTask);
   cleanupTask->enableDelayed();
