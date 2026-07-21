@@ -173,24 +173,24 @@ class BridgeCoordinationPackage : public plugin::BroadcastPackage {
 template <typename T>
 class PackageHandler : public layout::Layout<T> {
  public:
-  // NOTA: scheduler e' opzionale (default nullptr) per compatibilita' con
-  // le chiamate esistenti nella libreria; senza di esso non possiamo
-  // rilevare la task "corrente" e il comportamento resta quello originale.
-  // Passare lo scheduler (es. mesh.hpp gia' lo ha come mScheduler) evita
-  // pero' lo use-after-free descritto sotto.
+  // NOTE: scheduler is optional (defaults to nullptr) for backward
+  // compatibility with existing call sites; without it we can't detect
+  // the "current" task and behaviour falls back to the original one.
+  // Passing the scheduler (mesh.hpp already has it as mScheduler) avoids
+  // the use-after-free described below.
   void stop(Scheduler* scheduler = nullptr) {
-    // Se stop() viene chiamata da dentro il callback di una delle task in
-    // taskList (es. promoteToBridge()), quella task e' "this->getCurrentTask()"
-    // dello scheduler in questo preciso momento. Disabilitarla/azzerarne il
-    // callback o farne scendere a zero il refcount qui distruggerebbe la sua
-    // closure - che e' ancora sullo stack, nel bel mezzo della sua stessa
-    // esecuzione - causando un crash use-after-free (stessa famiglia del bug
-    // upstream #373, ma innescata dal refcount dello shared_ptr invece che
-    // da un delete diretto in onDisable).
-    // La lasciamo semplicemente nella lista: addTask() la riconoscera' come
-    // "disabilitata e con un solo riferimento" e la riciclera' alla
-    // prossima chiamata, esattamente come gia' previsto per le task
-    // anonime disabilitate (vedi commento di addTask() sopra).
+    // If stop() is called from within the callback of one of the tasks in
+    // taskList (e.g. promoteToBridge()), that task is
+    // "scheduler->getCurrentTask()" at this exact moment. Disabling it,
+    // clearing its callback, or letting its shared_ptr refcount drop to
+    // zero here would destroy its closure - which is still on the stack,
+    // in the middle of its own execution - causing a use-after-free crash
+    // (same bug family as upstream issue #373, but triggered by the
+    // shared_ptr refcount instead of a raw delete in onDisable).
+    // We simply leave it in the list: addTask() will recognise it as
+    // "disabled with a single reference" and reuse it on the next call,
+    // exactly like it already does for disabled anonymous tasks (see the
+    // comment on addTask() above).
     Task* current = scheduler ? scheduler->getCurrentTask() : nullptr;
     for (auto it = taskList.begin(); it != taskList.end();) {
       if (current != nullptr && it->get() == current) {
